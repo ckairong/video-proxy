@@ -41,7 +41,7 @@ const server = http.createServer(async (req, res) => {
     if (!u) { res.writeHead(400); res.end("Missing u"); return; }
     let target;
     try { target = new URL(u); } catch { res.writeHead(400); res.end("Bad url"); return; }
-    if (target.protocol !== "https:") { res.writeHead(400); res.end("https only"); return; }
+    if (target.protocol !== "https:" && target.protocol !== "http:") { res.writeHead(400); res.end("http(s) only"); return; }
     try {
       const up = await fetchUpstream(target.toString());
       const ct = up.headers["content-type"];
