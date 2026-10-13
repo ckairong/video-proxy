@@ -45,11 +45,15 @@ const server = http.createServer(async (req, res) => {
     try {
       const up = await fetchUpstream(target.toString());
       const ct = up.headers["content-type"];
-      res.writeHead(up.statusCode, {
+      const headers = {
         ...(ct ? { "content-type": ct } : {}),
         "Access-Control-Allow-Origin": "*",
         "Cache-Control": "public, max-age=3600",
-      });
+      };
+      // 转发 302 的 Location（上游 php 解析类地址依赖它），否则跟随跳转会断掉
+      const loc = up.headers["location"];
+      if (loc) headers["location"] = loc;
+      res.writeHead(up.statusCode, headers);
       up.pipe(res);
     } catch (e) {
       res.writeHead(502); res.end("Upstream error");
