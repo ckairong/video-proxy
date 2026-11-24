@@ -205,8 +205,14 @@ const server = http.createServer(async (req, res) => {
     try {
       // 可选 Range 透传 (?range=bytes=x-y): 大文件分段取流 (如 mp4 中转) 需要,
       // 带上后上游返回 206 与 content-range, 一并回传给调用方。
+      // 可选 Referer 覆盖 (?ref=<url>): 个别站点按 Referer 决定返回内容
+      // (如 avtoday 播放页, Referer 不对会跳回首页)。
       const range = url.searchParams.get("range");
-      const up = await fetchUpstream(target.toString(), range ? { Range: range } : undefined);
+      const ref = url.searchParams.get("ref");
+      const extra = {};
+      if (range) extra.Range = range;
+      if (ref) extra.Referer = ref;
+      const up = await fetchUpstream(target.toString(), Object.keys(extra).length ? extra : undefined);
       const ct = up.headers["content-type"];
       const headers = {
         ...(ct ? { "content-type": ct } : {}),
