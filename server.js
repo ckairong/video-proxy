@@ -74,6 +74,76 @@ function phFetch(targetUrl, jar) {
   });
 }
 
+// ---- 臻美视界 _guard 会话通道: 上游全站加了 JS 盾 (guard/guardret cookie 校验,
+// 且校验与出口 IP 绑定, Cloudflare 出口轮换过不了)。本通道在 LC 单一出口维护 cookie 罐,
+// 按 _guard/auto.js 的算法完成握手: guardret = AES-128-CBC(key=iv=MD5(guard[0:8]))
+// 加密 (解密(guard[12:]) 得到的数字 + 10)。响应体仍是上游的 AES 加密 JSON, 由调用方解密。
+const crypto = require("crypto");
+const ZM_SITE = "https://u4x28b.xxsxlr.top";
+const ZM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+const zmJar = new Map();
+let zmHandshakeInFlight = null;
+
+function zmFetchRaw(apiPath, withCookies) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(ZM_SITE + "/api" + apiPath);
+    const headers = { "User-Agent": ZM_UA, "Referer": ZM_SITE + "/", "Accept": "application/json,text/html,*/*" };
+    if (withCookies && zmJar.size) headers["Cookie"] = [...zmJar.entries()].map(([k, v]) => `${k}=${v}`).join("; ");
+    const req = https.request(u, { headers, timeout: 25000 }, (up) => {
+      const setCookies = up.headers["set-cookie"] || [];
+      for (const sc of setCookies) {
+        const pair = sc.split(";")[0];
+        const eq = pair.indexOf("=");
+        if (eq > 0) zmJar.set(pair.slice(0, eq).trim(), pair.slice(eq + 1).trim());
+      }
+      const chunks = [];
+      up.on("data", (c) => chunks.push(c));
+      up.on("end", () => resolve({ status: up.statusCode, body: Buffer.concat(chunks).toString("utf8") }));
+    });
+    req.on("error", reject);
+    req.on("timeout", () => { req.destroy(); reject(new Error("timeout")); });
+    req.end();
+  });
+}
+
+async function zmHandshake(apiPath) {
+  zmJar.delete("guard");
+  zmJar.delete("guardret");
+  await zmFetchRaw(apiPath, false);
+  const guard = zmJar.get("guard");
+  if (!guard || guard.length < 13) return false;
+  const key = crypto.createHash("md5").update(guard.slice(0, 8), "utf8").digest();
+  try {
+    const d = crypto.createDecipheriv("aes-128-cbc", key, key);
+    const plain = Buffer.concat([d.update(Buffer.from(guard.slice(12), "base64")), d.final()]).toString("utf8");
+    const n = parseInt(plain, 10);
+    if (Number.isNaN(n)) return false;
+    const c = crypto.createCipheriv("aes-128-cbc", key, key);
+    const ret = Buffer.concat([c.update(String(n + 10), "utf8"), c.final()]).toString("base64");
+    zmJar.set("guardret", ret);
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+function zmHandshakeOnce(apiPath) {
+  if (!zmHandshakeInFlight) {
+    zmHandshakeInFlight = zmHandshake(apiPath).finally(() => { zmHandshakeInFlight = null; });
+  }
+  return zmHandshakeInFlight;
+}
+
+async function zmApi(apiPath) {
+  let r = await zmFetchRaw(apiPath, true);
+  if (r.body.includes("_guard")) {
+    const ok = await zmHandshakeOnce(apiPath);
+    if (!ok) return r;
+    r = await zmFetchRaw(apiPath, true);
+  }
+  return r;
+}
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   if (url.pathname === "/ph/page" || url.pathname === "/ph/res") {
@@ -109,6 +179,18 @@ const server = http.createServer(async (req, res) => {
       if (up.headers["content-length"]) headers["content-length"] = up.headers["content-length"];
       res.writeHead(up.statusCode, headers);
       up.pipe(res);
+    } catch (e) {
+      res.writeHead(502); res.end("Upstream error");
+    }
+    return;
+  }
+  if (url.pathname === "/zm") {
+    const p = url.searchParams.get("path");
+    if (!p || !p.startsWith("/")) { res.writeHead(400); res.end("Bad path"); return; }
+    try {
+      const r = await zmApi(p);
+      res.writeHead(r.status, { "content-type": "application/json", "Access-Control-Allow-Origin": "*", "Cache-Control": "no-store" });
+      res.end(r.body);
     } catch (e) {
       res.writeHead(502); res.end("Upstream error");
     }
