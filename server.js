@@ -34,8 +34,86 @@ function relayRequest(targetUrl, method, headers, body) {
 
 const IMA_FORWARD_HEADERS = ["ima-openapi-clientid", "ima-openapi-apikey", "ima-openapi-ctx", "content-type"];
 
+// ---- Pornhub 专用会话通道: hv-h.phncdn.com 的签名地址除 IP 绑定外还校验页面会话 Cookie,
+// 必须由同一出口先取页面存下 Cookie, 再带 Cookie 取流。会话只存内存, 2 小时过期。
+const PH_SESSIONS = new Map(); // id -> { jar: Map<name, value>, at: number }
+const PH_TTL = 2 * 3600 * 1000;
+
+function phFetch(targetUrl, jar) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(targetUrl);
+    const lib = u.protocol === "https:" ? https : http;
+    const headers = {
+      "User-Agent": UA,
+      "Referer": "https://www.pornhub.com/",
+      "Accept-Language": "en-US,en;q=0.9",
+    };
+    if (jar && jar.size) {
+      headers["Cookie"] = [...jar.entries()].map(([k, v]) => `${k}=${v}`).join("; ");
+    }
+    const req = lib.request(u, { headers, timeout: 25000 }, (up) => {
+      if (jar) {
+        const setCookies = up.headers["set-cookie"] || [];
+        for (const sc of setCookies) {
+          const pair = sc.split(";")[0];
+          const eq = pair.indexOf("=");
+          if (eq > 0) jar.set(pair.slice(0, eq).trim(), pair.slice(eq + 1).trim());
+        }
+      }
+      // 跟随跳转 (带 Cookie)
+      if (up.statusCode >= 300 && up.statusCode < 400 && up.headers.location) {
+        up.resume();
+        resolve(phFetch(new URL(up.headers.location, u).toString(), jar));
+        return;
+      }
+      resolve(up);
+    });
+    req.on("error", reject);
+    req.on("timeout", () => { req.destroy(); reject(new Error("timeout")); });
+    req.end();
+  });
+}
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
+  if (url.pathname === "/ph/page" || url.pathname === "/ph/res") {
+    const u = url.searchParams.get("u");
+    if (!u) { res.writeHead(400); res.end("Missing u"); return; }
+    let target;
+    try { target = new URL(u); } catch { res.writeHead(400); res.end("Bad url"); return; }
+    if (!/(^|\.)pornhub\.com$|(^|\.)phncdn\.com$/.test(target.hostname)) {
+      res.writeHead(403); res.end("host not allowed"); return;
+    }
+    try {
+      let jar;
+      let sid = url.searchParams.get("s");
+      if (url.pathname === "/ph/page") {
+        sid = Math.random().toString(36).slice(2) + Date.now().toString(36);
+        jar = new Map();
+        PH_SESSIONS.set(sid, { jar, at: Date.now() });
+        // 顺手清理过期会话
+        for (const [k, v] of PH_SESSIONS) if (Date.now() - v.at > PH_TTL) PH_SESSIONS.delete(k);
+      } else {
+        const sess = sid ? PH_SESSIONS.get(sid) : null;
+        jar = sess ? sess.jar : new Map();
+        if (sess) sess.at = Date.now();
+      }
+      const up = await phFetch(target.toString(), jar);
+      const headers = {
+        "content-type": up.headers["content-type"] || "application/octet-stream",
+        "Access-Control-Allow-Origin": "*",
+        "Cache-Control": "no-store",
+      };
+      if (url.pathname === "/ph/page") headers["x-ph-session"] = sid;
+      if (up.headers["content-range"]) headers["content-range"] = up.headers["content-range"];
+      if (up.headers["content-length"]) headers["content-length"] = up.headers["content-length"];
+      res.writeHead(up.statusCode, headers);
+      up.pipe(res);
+    } catch (e) {
+      res.writeHead(502); res.end("Upstream error");
+    }
+    return;
+  }
   if (url.pathname === "/raw") {
     const u = url.searchParams.get("u");
     if (!u) { res.writeHead(400); res.end("Missing u"); return; }
