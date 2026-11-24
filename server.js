@@ -5,12 +5,12 @@ const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,
 const REFERER = "https://huangguoai.com/";
 const PORT = process.env.PORT || 3000;
 
-function fetchUpstream(targetUrl) {
+function fetchUpstream(targetUrl, extraHeaders) {
   return new Promise((resolve, reject) => {
     const u = new URL(targetUrl);
     const lib = u.protocol === "https:" ? https : http;
     const req = lib.request(u, {
-      headers: { "User-Agent": UA, "Referer": REFERER },
+      headers: { "User-Agent": UA, "Referer": REFERER, ...(extraHeaders || {}) },
       timeout: 25000,
     }, (res) => resolve(res));
     req.on("error", reject);
@@ -203,13 +203,19 @@ const server = http.createServer(async (req, res) => {
     try { target = new URL(u); } catch { res.writeHead(400); res.end("Bad url"); return; }
     if (target.protocol !== "https:" && target.protocol !== "http:") { res.writeHead(400); res.end("http(s) only"); return; }
     try {
-      const up = await fetchUpstream(target.toString());
+      // 可选 Range 透传 (?range=bytes=x-y): 大文件分段取流 (如 mp4 中转) 需要,
+      // 带上后上游返回 206 与 content-range, 一并回传给调用方。
+      const range = url.searchParams.get("range");
+      const up = await fetchUpstream(target.toString(), range ? { Range: range } : undefined);
       const ct = up.headers["content-type"];
       const headers = {
         ...(ct ? { "content-type": ct } : {}),
         "Access-Control-Allow-Origin": "*",
         "Cache-Control": "public, max-age=3600",
       };
+      for (const h of ["content-range", "accept-ranges", "content-length"]) {
+        if (up.headers[h]) headers[h] = up.headers[h];
+      }
       // 转发 302 的 Location（上游 php 解析类地址依赖它），否则跟随跳转会断掉
       const loc = up.headers["location"];
       if (loc) headers["location"] = loc;
